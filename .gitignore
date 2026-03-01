@@ -1,0 +1,4 @@
+.claude/
+instances/
+generated_instances/
+__pycache__/
