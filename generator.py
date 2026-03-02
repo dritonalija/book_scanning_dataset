@@ -5,6 +5,8 @@ import csv
 import glob
 import hashlib
 import shutil
+from itertools import combinations
+from collections import defaultdict
 import numpy as np
 import time
 
@@ -260,6 +262,7 @@ def compute_instance_stats(B, L, D, scores, libraries, seed_name="", scale=0.0, 
     # Score statistics
     score_mean = scores_arr.mean()
     score_std = scores_arr.std()
+    score_variance = float(scores_arr.var())
     score_cv = score_std / score_mean if score_mean > 0 else 0.0
 
     # Sampled Jaccard overlap (50 random pairs)
@@ -288,6 +291,14 @@ def compute_instance_stats(B, L, D, scores, libraries, seed_name="", scale=0.0, 
     # Library size stats
     lib_sizes = [lib['n_books'] for lib in libraries]
 
+    # Book duplication rate: fraction of books appearing in 2+ libraries
+    book_freq = defaultdict(int)
+    for lib in libraries:
+        for book_id in lib['books']:
+            book_freq[book_id] += 1
+    duplicated_books = sum(1 for freq in book_freq.values() if freq >= 2)
+    book_duplication_rate = duplicated_books / B if B > 0 else 0.0
+
     return {
         'seed': seed_name,
         'scale': scale,
@@ -305,31 +316,37 @@ def compute_instance_stats(B, L, D, scores, libraries, seed_name="", scale=0.0, 
         'ship_rate_std': round(ship_rates_arr.std(), 2),
         'score_mean': round(score_mean, 2),
         'score_std': round(score_std, 2),
+        'score_variance': round(score_variance, 2),
         'score_cv': round(score_cv, 4),
         'jaccard_overlap_mean': round(jaccard_mean, 4),
         'book_coverage': round(book_coverage, 4),
+        'book_duplication_rate': round(book_duplication_rate, 4),
         'lib_size_mean': round(np.mean(lib_sizes), 2),
         'lib_size_std': round(np.std(lib_sizes), 2),
     }
 
 
-def instance_filename(seed_letter, scale, tightness, replicate=None):
-    """Generate filename: {seed_letter}_{scale}x_{tightness}t[_r{N}].txt"""
+def instance_filename(seed_letter, scale, tightness):
+    """Generate filename: {seed_letter}_{scale}x_{tightness}t.txt"""
     scale_int = str(round(scale * 100)).zfill(3)
     tightness_int = str(round(tightness * 100)).zfill(3)
-    base = f"{seed_letter}_{scale_int}x_{tightness_int}t"
-    if replicate is not None:
-        base += f"_r{replicate}"
-    return base + ".txt"
+    return f"{seed_letter}_{scale_int}x_{tightness_int}t.txt"
 
 
 def generate_batch(seed_dir, out_dir, random_seed=42, scales=None,
-                    tightness_levels=None, replicates=1, include_seeds=False, noise=None):
-    """Generate instances using a systematic grid of seeds x scales x tightness x replicates."""
+                    tightness_levels=None, include_seeds=False, noise=None,
+                    crossbreed=False):
+    """Generate instances using a systematic grid of seeds x scales x tightness."""
     if scales is None:
-        scales = [0.25, 0.5, 0.75, 1.0, 1.5]
+        if crossbreed:
+            scales = [0.25, 0.5, 1.0]          # 15 sources x 3 x 3 = 135
+        else:
+            scales = [0.25, 0.5, 0.75, 1.0]    # 5 seeds x 4 x 5 = 100
     if tightness_levels is None:
-        tightness_levels = [0.1, 0.25, 0.5, 0.75, 1.0]
+        if crossbreed:
+            tightness_levels = [0.1, 0.5, 1.0]
+        else:
+            tightness_levels = [0.1, 0.25, 0.5, 0.75, 1.0]
     if noise is None:
         noise = 0.2
 
@@ -337,13 +354,12 @@ def generate_batch(seed_dir, out_dir, random_seed=42, scales=None,
     test_names = set()
     for s in scales:
         for t in tightness_levels:
-            for r in range(1, replicates + 1):
-                name = instance_filename('x', s, t, replicate=r if replicates > 1 else None)
-                if name in test_names:
-                    print(f"Error: scale={s} and tightness={t} produce a duplicate filename '{name}'.")
-                    print("Use values that differ by at least 0.01 to avoid collisions.")
-                    sys.exit(1)
-                test_names.add(name)
+            name = instance_filename('x', s, t)
+            if name in test_names:
+                print(f"Error: scale={s} and tightness={t} produce a duplicate filename '{name}'.")
+                print("Use values that differ by at least 0.01 to avoid collisions.")
+                sys.exit(1)
+            test_names.add(name)
 
     # Auto-discover seed files
     seed_files = sorted(glob.glob(os.path.join(seed_dir, '*.txt')))
@@ -351,10 +367,37 @@ def generate_batch(seed_dir, out_dir, random_seed=42, scales=None,
         print(f"Error: No seed files found in {seed_dir}")
         sys.exit(1)
 
-    n_generated = len(seed_files) * len(scales) * len(tightness_levels) * replicates
-    print(f"Found {len(seed_files)} seed files: {[os.path.basename(f) for f in seed_files]}")
-    print(f"Grid: {len(seed_files)} seeds x {len(scales)} scales x {len(tightness_levels)} tightness"
-          f" x {replicates} replicates = {n_generated} instances")
+    # Pre-read all seeds and build unified source list
+    seed_cache = {}
+    for sf in seed_files:
+        letter = detect_seed_letter(sf)
+        if letter is None:
+            print(f"Warning: Could not detect seed letter from {sf}, skipping")
+            continue
+        seed_cache[sf] = (letter, *read_instance(sf))
+
+    # Sources: each entry is (name, B, L, D, scores, libraries, score_seed_letter)
+    sources = []
+    for sf in seed_files:
+        if sf not in seed_cache:
+            continue
+        letter, B, L, D, scores, libs = seed_cache[sf]
+        sources.append((letter, B, L, D, scores, libs, letter))
+
+    if crossbreed and len(seed_cache) >= 2:
+        for sf_a, sf_b in combinations(seed_cache.keys(), 2):
+            la, Ba, _, _, sa, _ = seed_cache[sf_a]
+            lb, _, Lb, Db, _, libs_b = seed_cache[sf_b]
+            sources.append((f"{la}{lb}", Ba, Lb, Db, sa, libs_b, la))
+
+    n_generated = len(sources) * len(scales) * len(tightness_levels)
+    n_single = len([s for s in sources if len(s[0]) == 1])
+    n_cross = len(sources) - n_single
+    print(f"Found {len(seed_cache)} seed files: {[os.path.basename(f) for f in seed_files if f in seed_cache]}")
+    if crossbreed and n_cross > 0:
+        print(f"Sources: {n_single} seeds + {n_cross} cross-bred pairs = {len(sources)} sources")
+    print(f"Grid: {len(sources)} sources x {len(scales)} scales x {len(tightness_levels)} tightness"
+          f" = {n_generated} instances")
     print(f"Scales: {scales}")
     print(f"Tightness: {tightness_levels}")
     print(f"Noise: {noise}, Random seed: {random_seed}")
@@ -368,75 +411,62 @@ def generate_batch(seed_dir, out_dir, random_seed=42, scales=None,
     # Optionally copy original seed files into output
     if include_seeds:
         print("--- Including original seed instances ---")
-        for seed_file in seed_files:
-            dest = os.path.join(out_dir, os.path.basename(seed_file))
-            shutil.copy2(seed_file, dest)
-            print(f"  Copied {os.path.basename(seed_file)}")
-
-            # Also compute stats for seed instances
-            B, L, D, scores, libraries = read_instance(seed_file)
-            seed_letter = detect_seed_letter(seed_file)
+        for sf in seed_files:
+            if sf not in seed_cache:
+                continue
+            dest = os.path.join(out_dir, os.path.basename(sf))
+            shutil.copy2(sf, dest)
+            letter, B, L, D, scores, libs = seed_cache[sf]
+            print(f"  Copied {os.path.basename(sf)}")
             stats = compute_instance_stats(
-                B, L, D, scores, libraries,
-                seed_name=f"{seed_letter}_orig", scale=1.0, tightness_param=0.0
+                B, L, D, scores, libs,
+                seed_name=f"{letter}_orig", scale=1.0, tightness_param=0.0
             )
             all_stats.append(stats)
         print()
 
-    for seed_file in seed_files:
-        seed_letter = detect_seed_letter(seed_file)
-        if seed_letter is None:
-            print(f"Warning: Could not detect seed letter from {seed_file}, skipping")
-            continue
-
-        print(f"--- Seed: {os.path.basename(seed_file)} (letter={seed_letter}) ---")
-        B, L, D, scores, libraries = read_instance(seed_file)
+    for src_name, B, L, D, scores, libraries, score_letter in sources:
+        is_cross = len(src_name) > 1
+        if is_cross:
+            print(f"--- Cross-breed: {src_name[0]} (scores) x {src_name[1]} (structure) ---")
+        else:
+            print(f"--- Seed: {src_name} ---")
 
         for scale in scales:
             for tightness in tightness_levels:
-                for rep in range(1, replicates + 1):
-                    count += 1
-                    # Deterministic RNG: hashlib instead of hash() for cross-platform reproducibility
-                    key = f"{random_seed}_{seed_letter}_{scale}_{tightness}_{rep}"
-                    instance_seed = int(hashlib.sha256(key.encode()).hexdigest(), 16) % (2**31)
-                    rng = np.random.default_rng(instance_seed)
+                count += 1
+                # Deterministic RNG: hashlib for cross-platform reproducibility
+                key = f"{random_seed}_{src_name}_{scale}_{tightness}"
+                instance_seed = int(hashlib.sha256(key.encode()).hexdigest(), 16) % (2**31)
+                rng = np.random.default_rng(instance_seed)
 
-                    t0 = time.time()
-                    nB, nL, nD, nScores, nLibs = generate_new_instance(
-                        B, L, D, scores, libraries, scale, noise, rng,
-                        tightness=tightness, seed_letter=seed_letter
-                    )
+                t0 = time.time()
+                nB, nL, nD, nScores, nLibs = generate_new_instance(
+                    B, L, D, scores, libraries, scale, noise, rng,
+                    tightness=tightness, seed_letter=score_letter
+                )
 
-                    validate_instance(nB, nL, nD, nScores, nLibs)
+                validate_instance(nB, nL, nD, nScores, nLibs)
 
-                    rep_tag = rep if replicates > 1 else None
-                    fname = instance_filename(seed_letter, scale, tightness, replicate=rep_tag)
-                    fpath = os.path.join(out_dir, fname)
-                    write_instance(fpath, nB, nL, nD, nScores, nLibs)
-                    elapsed = time.time() - t0
+                fname = instance_filename(src_name, scale, tightness)
+                fpath = os.path.join(out_dir, fname)
+                write_instance(fpath, nB, nL, nD, nScores, nLibs)
+                elapsed = time.time() - t0
 
-                    stats = compute_instance_stats(
-                        nB, nL, nD, nScores, nLibs,
-                        seed_name=seed_letter, scale=scale, tightness_param=tightness
-                    )
-                    if replicates > 1:
-                        stats['replicate'] = rep
-                    all_stats.append(stats)
+                stats = compute_instance_stats(
+                    nB, nL, nD, nScores, nLibs,
+                    seed_name=src_name, scale=scale, tightness_param=tightness
+                )
+                all_stats.append(stats)
 
-                    print(f"  [{count}/{n_generated}] {fname}  "
-                          f"(B={nB}, L={nL}, D={nD}, tightness={stats['actual_tightness']}) "
-                          f"— {elapsed:.2f}s")
+                print(f"  [{count}/{n_generated}] {fname}  "
+                      f"(B={nB}, L={nL}, D={nD}, tightness={stats['actual_tightness']}) "
+                      f"— {elapsed:.2f}s")
 
     # Write summary CSV
     csv_path = os.path.join(out_dir, 'summary.csv')
     if all_stats:
         fieldnames = list(all_stats[0].keys())
-        # Ensure 'replicate' column is present if any row has it
-        if any('replicate' in s for s in all_stats):
-            if 'replicate' not in fieldnames:
-                fieldnames.append('replicate')
-            for s in all_stats:
-                s.setdefault('replicate', 1)
         with open(csv_path, 'w', newline='') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
@@ -458,17 +488,18 @@ def main():
     parser.add_argument('--tightness', type=float, default=None,
                         help="Tightness parameter (0.1=hard, 1.0=easy). Controls D relative to total signup.")
     parser.add_argument('--batch', action='store_true',
-                        help="Batch mode: generate instances from a grid of seeds x scales x tightness x replicates")
+                        help="Batch mode: generate instances from a grid of seeds x scales x tightness")
     parser.add_argument('--seed_dir', type=str, default='seed',
                         help="Directory containing seed files (used with --batch)")
     parser.add_argument('--scales', type=float, nargs='+', default=None,
-                        help="Scale factors for batch mode (default: 0.25 0.5 0.75 1.0 1.5)")
+                        help="Scale factors for batch mode (default: 0.25 0.5 0.75 1.0; with --crossbreed: 0.25 0.5 1.0)")
     parser.add_argument('--tightness_levels', type=float, nargs='+', default=None,
-                        help="Tightness levels for batch mode (default: 0.1 0.25 0.5 0.75 1.0)")
-    parser.add_argument('--replicates', type=int, default=1,
-                        help="Number of replicates per (seed, scale, tightness) combination (default: 1)")
+                        help="Tightness levels for batch mode (default: 0.1 0.25 0.5 0.75 1.0; with --crossbreed: 0.1 0.5 1.0)")
     parser.add_argument('--include_seeds', action='store_true',
                         help="Copy original seed instances into the output directory and include in summary")
+    parser.add_argument('--crossbreed', action='store_true',
+                        help="Generate hybrid instances by cross-breeding pairs of seeds "
+                             "(scores from one seed, library structure from another)")
 
     args = parser.parse_args()
 
@@ -478,9 +509,9 @@ def main():
             random_seed=args.seed if args.seed is not None else 42,
             scales=args.scales,
             tightness_levels=args.tightness_levels,
-            replicates=args.replicates,
             include_seeds=args.include_seeds,
             noise=args.noise,
+            crossbreed=args.crossbreed,
         )
         return
 

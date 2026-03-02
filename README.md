@@ -18,7 +18,7 @@ The generator takes a seed file, a `scale` factor, and a `noise` (perturbation) 
 
 ### Reproducibility
 
-All randomness is seeded deterministically using SHA-256 hashing of the parameter tuple `(random_seed, seed_letter, scale, tightness, replicate)`. This guarantees **identical output across Python versions, platforms, and runs** (unlike Python's built-in `hash()` which is randomized since Python 3.3).
+All randomness is seeded deterministically using SHA-256 hashing of the parameter tuple `(random_seed, seed_letter, scale, tightness)`. This guarantees **identical output across Python versions, platforms, and runs** (unlike Python's built-in `hash()` which is randomized since Python 3.3).
 
 To reproduce the default dataset:
 ```bash
@@ -58,20 +58,14 @@ If you run with `--scale 0.5 --tightness 0.5 --noise 0.2`, one possible generate
 Batch mode generates a systematic full-factorial grid of instances with a single command. The grid dimensions are fully configurable:
 
 ```bash
-# Default: 5 seeds x 5 scales x 5 tightness = 125 instances
+# Default: 5 seeds x 4 scales x 5 tightness = 100 instances
 python generator.py --batch --seed 42 --out_dir instances
-
-# With replicates for statistical significance: 5x5x5x3 = 375 instances
-python generator.py --batch --seed 42 --replicates 3 --out_dir instances
-
-# Custom grid: 5 seeds x 6 scales x 5 tightness = 150 instances
-python generator.py --batch --seed 42 --scales 0.25 0.5 0.75 1.0 1.5 2.0 --out_dir instances
 
 # Include original Hash Code seed instances in output
 python generator.py --batch --seed 42 --include_seeds --out_dir instances
 ```
 
-**Default parameter grid (125 instances):**
+**Default parameter grid (100 instances):**
 
 | Scale | Books (approx.) | Tightness levels |
 |-------|-----------------|------------------|
@@ -79,27 +73,62 @@ python generator.py --batch --seed 42 --include_seeds --out_dir instances
 | 0.50 | ~50K | 0.1, 0.25, 0.5, 0.75, 1.0 |
 | 0.75 | ~75K | 0.1, 0.25, 0.5, 0.75, 1.0 |
 | 1.00 | ~100K | 0.1, 0.25, 0.5, 0.75, 1.0 |
-| 1.50 | ~150K | 0.1, 0.25, 0.5, 0.75, 1.0 |
 
 All batch instances use `noise=0.2` and a fixed random seed (default 42) for reproducibility.
 
-**Naming convention:** `{seed_letter}_{scale}x_{tightness}t[_r{N}].txt`
-- Without replicates: `b_025x_010t.txt` - seed b, scale 0.25, tightness 0.1
-- With replicates: `b_025x_010t_r1.txt`, `b_025x_010t_r2.txt`, ...
-- Regex-parseable: `([bcdef])_(\d+)x_(\d+)t(?:_r(\d+))?\.txt`
+**Naming convention:** `{seed_letter}_{scale}x_{tightness}t.txt`
+- Example: `b_025x_010t.txt` — seed b, scale 0.25, tightness 0.1
+- Regex-parseable: `([bcdef])_(\d+)x_(\d+)t\.txt`
 
 **Batch parameters:**
 - `--batch` (Required): Enables batch mode.
 - `--seed_dir` (Optional): Directory containing seed files (default: `seed`).
 - `--seed` (Optional): Random seed for reproducibility (default: 42).
 - `--out_dir` (Optional): Output directory (default: `generated_instances`).
-- `--scales` (Optional): Custom list of scale factors (default: `0.25 0.5 0.75 1.0 1.5`).
-- `--tightness_levels` (Optional): Custom list of tightness levels (default: `0.1 0.25 0.5 0.75 1.0`).
-- `--replicates` (Optional): Number of replicates per (seed, scale, tightness) combination (default: 1). Use 3-5 for statistical significance when benchmarking solvers.
+- `--scales` (Optional): Custom list of scale factors (default: `0.25 0.5 0.75 1.0`; with `--crossbreed`: `0.25 0.5 1.0`).
+- `--tightness_levels` (Optional): Custom list of tightness levels (default: `0.1 0.25 0.5 0.75 1.0`; with `--crossbreed`: `0.1 0.5 1.0`).
 - Values that round to the same `x100` filename token are rejected in batch mode (for example `0.251` and `0.252` both map to `025`).
 - `--include_seeds` (Optional): Copy the original Hash Code seed instances into the output directory and include their statistics in `summary.csv`.
 - `--noise` (Optional): Noise factor for batch mode (default: 0.2).
 
-**Output:** A `summary.csv` file is written to the output directory with per-instance statistics including: B, L, D, total signup, actual tightness, signup/ship-rate/score statistics (mean, std, CV), sampled Jaccard overlap, book coverage, and replicate number (when replicates > 1).
+**Output:** A `summary.csv` file is written to the output directory with per-instance statistics including: B, L, D, total signup, actual tightness, signup/ship-rate/score statistics (mean, std, variance, CV), sampled Jaccard overlap, book coverage, and book duplication rate.
+
+### Cross-Breeding Mode
+
+Cross-breeding generates hybrid instances by combining characteristics from **two different seed instances**: book scores from one seed and library structure (signup times, ship rates, collection sizes) from another. This fills gaps in the feature space that single-seed generation cannot reach.
+
+With `--crossbreed`, the 5 single seeds are joined by $\binom{5}{2} = 10$ cross-bred pairs, giving **15 sources** total. All sources share the same scale x tightness grid, so you control the total instance count by adjusting the grid:
+
+```bash
+# Default crossbreed: 15 sources x 3 scales x 3 tightness = 135 instances
+python generator.py --batch --seed 42 --crossbreed --out_dir instances
+
+# Custom grid
+python generator.py --batch --seed 42 --crossbreed --scales 0.5 1.0 --tightness_levels 0.1 0.25 0.5 1.0 --out_dir instances
+```
+
+**Naming convention for hybrids:** `{letter_a}{letter_b}_{scale}x_{tightness}t.txt`
+- Example: `bc_050x_025t.txt` — scores from seed b, library structure from seed c, scale 0.50, tightness 0.25
+
+**Parameters:**
+- `--crossbreed` (Optional): Enable cross-breeding. Only works with `--batch` and requires at least 2 seed files.
+
+---
+
+## 2. Feature Analysis (`analyze.py`)
+
+After generating instances, use `analyze.py` to visualize the feature space and verify that your instances have good diversity. It performs PCA dimensionality reduction on 11 instance features and produces an interactive Plotly scatter plot.
+
+```bash
+# Basic: open interactive plot in browser
+python analyze.py --summary instances/summary.csv
+
+# Save plot as HTML file
+python analyze.py --summary instances/summary.csv --save feature_space.html
+```
+
+**Features used for PCA:** B, L, D, score mean, score variance, signup mean, ship rate mean, book duplication rate, book coverage, library size mean, actual tightness.
+
+**Dependencies:** `pandas`, `scikit-learn`, `plotly`
 
 ---
