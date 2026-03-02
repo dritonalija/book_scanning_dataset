@@ -36,10 +36,22 @@ python generator.py seed/b_read_on.txt --count 5 --scale 0.8 --noise 0.2
 - `seed_file` (Required): The path to the original text file used as the base (e.g., `seed/d_tough_choices.txt`).
 - `--count` (Optional): The number of new instances to generate (default: 1).
 - `--scale` (Optional): Factor to increase/decrease the problem size. For example, `1.5` makes the instance roughly 50% larger; `0.8` makes it 20% smaller (default: 1.0).
-- `--noise` (Optional): Fluctuation percentage applied to metrics. `0.2` means properties will randomly fluctuate by $\pm 20\%$ (default: 0.1).
-- `--tightness` (Optional): Controls $D$ relative to total signup time. Range 0.1 (hard/constrained) to 1.0 (easy/loose). When omitted, $D$ scales from the seed as before.
+- `--noise` (Optional): Fluctuation percentage applied to metrics. `0.2` means properties will randomly fluctuate by $\pm 20\%$ (default: 0.2).
+- `--tightness` (Optional): Controls $D$ relative to total signup time. Range 0.1 (heavily constrained - only ~10% of libraries can sign up) to 1.0 (least constrained - enough time to sign up all libraries sequentially). When omitted, $D$ scales from the seed as before.
 - `--out_dir` (Optional): Directory where generated files are saved (default: `generated_instances`).
 - `--seed` (Optional): Set a random seed for reproducible generation.
+
+### Small Example (Scale + Tightness + Noise)
+
+Assume a seed with `B=1000`, `L=100`, and one library with `signup=10`, `ship_rate=4`, `n_books=120`.
+
+If you run with `--scale 0.5 --tightness 0.5 --noise 0.2`, one possible generated outcome is:
+- `B` around `1000 * 0.5`, then perturbed in `[0.8, 1.2]` (for example, `550`)
+- `L` around `100 * 0.5`, then perturbed in `[0.8, 1.2]` (for example, `45`)
+- library `signup` around `10`, perturbed in `[0.8, 1.2]` (for example, `12`)
+- library `ship_rate` around `4`, perturbed in `[0.8, 1.2]` (for example, `3`)
+- library `n_books` around `120 * 0.5`, perturbed in `[0.8, 1.2]` (for example, `66`)
+- final `D` is derived from `tightness * total_signup` of generated libraries
 
 ### Batch Mode
 
@@ -72,7 +84,7 @@ python generator.py --batch --seed 42 --include_seeds --out_dir instances
 All batch instances use `noise=0.2` and a fixed random seed (default 42) for reproducibility.
 
 **Naming convention:** `{seed_letter}_{scale}x_{tightness}t[_r{N}].txt`
-- Without replicates: `b_025x_010t.txt` — seed b, scale 0.25, tightness 0.1
+- Without replicates: `b_025x_010t.txt` - seed b, scale 0.25, tightness 0.1
 - With replicates: `b_025x_010t_r1.txt`, `b_025x_010t_r2.txt`, ...
 - Regex-parseable: `([bcdef])_(\d+)x_(\d+)t(?:_r(\d+))?\.txt`
 
@@ -84,39 +96,10 @@ All batch instances use `noise=0.2` and a fixed random seed (default 42) for rep
 - `--scales` (Optional): Custom list of scale factors (default: `0.25 0.5 0.75 1.0 1.5`).
 - `--tightness_levels` (Optional): Custom list of tightness levels (default: `0.1 0.25 0.5 0.75 1.0`).
 - `--replicates` (Optional): Number of replicates per (seed, scale, tightness) combination (default: 1). Use 3-5 for statistical significance when benchmarking solvers.
+- Values that round to the same `x100` filename token are rejected in batch mode (for example `0.251` and `0.252` both map to `025`).
 - `--include_seeds` (Optional): Copy the original Hash Code seed instances into the output directory and include their statistics in `summary.csv`.
 - `--noise` (Optional): Noise factor for batch mode (default: 0.2).
 
 **Output:** A `summary.csv` file is written to the output directory with per-instance statistics including: B, L, D, total signup, actual tightness, signup/ship-rate/score statistics (mean, std, CV), sampled Jaccard overlap, book coverage, and replicate number (when replicates > 1).
 
 ---
-
-## 2. ILS Solver (`final_ils_solver.py`)
-
-The solver uses Iterated Local Search combined with an Adaptive Heap greedy initialization strategy. It is heavily optimized, relying on **in-place** modifications (zero deep copying) and **Numba JIT** compiled code for $50\times$ faster scoring evaluations.
-
-### Usage
-
-To run the solver, provide the input file, output file name, and search time limit (in seconds):
-```bash
-python final_ils_solver.py generated_instances/d_tough_choices_s0.8_n0.2_1.txt my_solution.txt 60
-```
-
-**Required Positional Arguments:**
-1. `input_path`: Path to the compiled instance you want to solve (e.g., `generated_instances/...`).
-2. `output_path`: Path & filename where the final submission format should be saved (e.g., `solution.txt`).
-3. `time_limit`: Number of seconds the local search should run (e.g., `30` or `60`).
-
-**Optional Tuning Parameters:**
-You can pass additional flags to adjust the algorithm's behavior:
-- `--p_swap`: Probability of choosing a "SWAP" move (default: 0.4).
-- `--p_insert`: Probability of choosing an "INSERT/REMOVE" move (default: 0.3). The implicit remainder goes to "MOVE" operations.
-- `--anneal_prob`: Probability of accepting a worse solution to escape local optima via Simulated Annealing (default: 0.0005).
-- `--alphas`: Provide a list of alpha values to use in the Adaptive Heap initialization (default: `0.5 1.0 1.5 2.0 3.0`).
-- `--run_exact`: Add this flag to also run the exact $O(N^2)$ weighted initialization (slower but potentially better starting bounds).
-- `--seed`: Random seed for reproducibility.
-
-**Example with custom heuristics:**
-```bash
-python final_ils_solver.py my_instance.txt sol.txt 120 --p_swap 0.5 --anneal_prob 0.001 --alphas 1.0 2.0
-```

@@ -1,5 +1,4 @@
 import sys
-import random
 import argparse
 import os
 import csv
@@ -12,6 +11,16 @@ import time
 
 # Seeds with uniform score distributions (need normal sampling)
 UNIFORM_SCORE_SEEDS = {'b', 'd'}
+
+# Hash Code 2020 official bounds (from problem statement)
+MAX_B = 10**5       # max books
+MAX_L = 10**5       # max libraries
+MAX_D = 10**5       # max days
+MAX_SCORE = 10**3   # max score per book (0 <= S_i <= 1000)
+MAX_N = 10**5       # max books per library
+MAX_T = 10**5       # max signup days per library
+MAX_M = 10**5       # max ship rate per library
+MAX_TOTAL_BOOKS = 10**6  # total books across all libraries
 
 
 def read_instance(filepath):
@@ -49,27 +58,48 @@ def write_instance(filepath, B, L, D, scores, libraries):
 
 
 def validate_instance(B, L, D, scores, libraries):
-    """Validate that a generated instance is well-formed."""
+    """Validate that a generated instance conforms to Hash Code 2020 bounds."""
     errors = []
+    # Global bounds
+    if not (1 <= B <= MAX_B):
+        errors.append(f"B={B} out of range [1, {MAX_B}]")
+    if not (1 <= L <= MAX_L):
+        errors.append(f"L={L} out of range [1, {MAX_L}]")
+    if not (1 <= D <= MAX_D):
+        errors.append(f"D={D} out of range [1, {MAX_D}]")
     if len(scores) != B:
         errors.append(f"Score count {len(scores)} != B={B}")
     if len(libraries) != L:
         errors.append(f"Library count {len(libraries)} != L={L}")
-    if D < 1:
-        errors.append(f"D={D} must be >= 1")
+
+    # Score bounds
+    for idx, s in enumerate(scores):
+        if not (0 <= s <= MAX_SCORE):
+            errors.append(f"Score[{idx}]={s} out of range [0, {MAX_SCORE}]")
+            break
+
+    # Per-library and total books
+    total_books = 0
     for i, lib in enumerate(libraries):
         if lib['n_books'] != len(lib['books']):
             errors.append(f"Library {i}: n_books={lib['n_books']} != len(books)={len(lib['books'])}")
-        if lib['signup'] < 1:
-            errors.append(f"Library {i}: signup={lib['signup']} < 1")
-        if lib['ship_rate'] < 1:
-            errors.append(f"Library {i}: ship_rate={lib['ship_rate']} < 1")
+        if not (1 <= lib['signup'] <= MAX_T):
+            errors.append(f"Library {i}: signup={lib['signup']} out of range [1, {MAX_T}]")
+        if not (1 <= lib['ship_rate'] <= MAX_M):
+            errors.append(f"Library {i}: ship_rate={lib['ship_rate']} out of range [1, {MAX_M}]")
+        if not (1 <= lib['n_books'] <= MAX_N):
+            errors.append(f"Library {i}: n_books={lib['n_books']} out of range [1, {MAX_N}]")
         for book_id in lib['books']:
             if book_id < 0 or book_id >= B:
                 errors.append(f"Library {i}: book {book_id} out of range [0, {B})")
                 break
         if len(lib['books']) != len(set(lib['books'])):
             errors.append(f"Library {i}: duplicate books")
+        total_books += lib['n_books']
+
+    if total_books > MAX_TOTAL_BOOKS:
+        errors.append(f"Total books across libraries {total_books} > {MAX_TOTAL_BOOKS}")
+
     if errors:
         raise ValueError("Instance validation failed:\n" + "\n".join(errors))
     return True
@@ -94,7 +124,6 @@ def generate_scores(orig_scores, new_B, seed_letter, noise, rng):
     """
     orig = np.array(orig_scores, dtype=np.float64)
     mean_score = orig.mean()
-    std_score = orig.std()
 
     if seed_letter in UNIFORM_SCORE_SEEDS:
         # Normal distribution centered at original mean
@@ -106,8 +135,8 @@ def generate_scores(orig_scores, new_B, seed_letter, noise, rng):
         noise_vals = rng.uniform(1.0 - noise, 1.0 + noise, size=new_B)
         new_scores = resampled * noise_vals
 
-    # Clamp to [1, inf) and convert to int
-    new_scores = np.maximum(1, np.round(new_scores)).astype(np.int64)
+    # Clamp to [0, MAX_SCORE] per Hash Code spec and convert to int
+    new_scores = np.clip(np.round(new_scores), 0, MAX_SCORE).astype(np.int64)
     return new_scores.tolist()
 
 
@@ -138,9 +167,9 @@ def generate_popularity_weights(new_B, rng):
 def generate_new_instance(B, L, D, scores, libraries, scale_factor, noise, rng,
                           tightness=None, seed_letter=None):
     """Generates a new instance by scaling and perturbing the seed instance."""
-    # Apply noise to B and L dimensions
-    new_B = max(1, int(B * scale_factor * rng.uniform(1.0 - noise, 1.0 + noise)))
-    new_L = max(1, int(L * scale_factor * rng.uniform(1.0 - noise, 1.0 + noise)))
+    # Apply noise to B and L dimensions, clamped to Hash Code bounds
+    new_B = max(1, min(int(B * scale_factor * rng.uniform(1.0 - noise, 1.0 + noise)), MAX_B))
+    new_L = max(1, min(int(L * scale_factor * rng.uniform(1.0 - noise, 1.0 + noise)), MAX_L))
 
     # Generate scores using improved method
     if seed_letter is None:
@@ -150,19 +179,34 @@ def generate_new_instance(B, L, D, scores, libraries, scale_factor, noise, rng,
     # Generate popularity weights for book assignment
     popularity_weights = generate_popularity_weights(new_B, rng)
 
+    # Map each new library to a seed library:
+    # - same size: 1-to-1 mapping
+    # - downscale (new_L < L): sample without replacement (no duplicates)
+    # - upscale (new_L > L): use all L at least once, then fill remainder randomly
+    if new_L == L:
+        lib_indices = list(range(L))
+    elif new_L < L:
+        lib_indices = rng.choice(L, size=new_L, replace=False).tolist()
+    else:
+        base = np.arange(L)
+        extra = rng.choice(L, size=new_L - L, replace=True)
+        lib_indices = np.concatenate([base, extra])
+        rng.shuffle(lib_indices)
+        lib_indices = lib_indices.tolist()
+
     new_libraries = []
     total_signup = 0
     for i in range(new_L):
-        orig_lib = libraries[i % L]
+        orig_lib = libraries[lib_indices[i]]
 
-        # Perturb signup and ship rate
-        new_signup = max(1, int(orig_lib['signup'] * rng.uniform(1.0 - noise, 1.0 + noise)))
-        new_ship_rate = max(1, int(orig_lib['ship_rate'] * rng.uniform(1.0 - noise, 1.0 + noise)))
+        # Perturb signup and ship rate, clamped to Hash Code bounds
+        new_signup = max(1, min(int(orig_lib['signup'] * rng.uniform(1.0 - noise, 1.0 + noise)), MAX_T))
+        new_ship_rate = max(1, min(int(orig_lib['ship_rate'] * rng.uniform(1.0 - noise, 1.0 + noise)), MAX_M))
 
-        # Determine target number of books (also perturbed with noise)
+        # Determine target number of books (clamped to new_B and MAX_N)
         target_n_books = max(1, min(
             int(orig_lib['n_books'] * scale_factor * rng.uniform(1.0 - noise, 1.0 + noise)),
-            new_B
+            new_B, MAX_N
         ))
 
         # Popularity-weighted book assignment
@@ -176,16 +220,26 @@ def generate_new_instance(B, L, D, scores, libraries, scale_factor, noise, rng,
         })
         total_signup += new_signup
 
-    # Compute D based on tightness or scale from seed
+    # Enforce total books across all libraries <= MAX_TOTAL_BOOKS
+    total_books = sum(lib['n_books'] for lib in new_libraries)
+    if total_books > MAX_TOTAL_BOOKS:
+        # Trim libraries from the end until under budget
+        while total_books > MAX_TOTAL_BOOKS and len(new_libraries) > 1:
+            removed = new_libraries.pop()
+            total_books -= removed['n_books']
+            total_signup -= removed['signup']
+        new_L = len(new_libraries)
+
+    # Compute D based on tightness or scale from seed, clamped to MAX_D
     if tightness is not None:
-        new_D = max(1, int(total_signup * tightness))
+        new_D = max(1, min(int(total_signup * tightness), MAX_D))
     else:
-        new_D = max(1, int(D * scale_factor * rng.uniform(1.0 - noise, 1.0 + noise)))
+        new_D = max(1, min(int(D * scale_factor * rng.uniform(1.0 - noise, 1.0 + noise)), MAX_D))
 
     # Feasibility guarantee: D must be > min signup time
     min_signup = min(lib['signup'] for lib in new_libraries)
     if new_D <= min_signup:
-        new_D = max(new_D, int(min_signup * 1.5))
+        new_D = min(max(new_D, int(min_signup * 1.5)), MAX_D)
 
     return new_B, new_L, new_D, new_scores, new_libraries
 
@@ -259,8 +313,8 @@ def compute_instance_stats(B, L, D, scores, libraries, seed_name="", scale=0.0, 
 
 def instance_filename(seed_letter, scale, tightness, replicate=None):
     """Generate filename: {seed_letter}_{scale}x_{tightness}t[_r{N}].txt"""
-    scale_int = str(int(scale * 100)).zfill(3)
-    tightness_int = str(int(tightness * 100)).zfill(3)
+    scale_int = str(round(scale * 100)).zfill(3)
+    tightness_int = str(round(tightness * 100)).zfill(3)
     base = f"{seed_letter}_{scale_int}x_{tightness_int}t"
     if replicate is not None:
         base += f"_r{replicate}"
@@ -268,12 +322,26 @@ def instance_filename(seed_letter, scale, tightness, replicate=None):
 
 
 def generate_batch(seed_dir, out_dir, random_seed=42, scales=None,
-                    tightness_levels=None, replicates=1, include_seeds=False, noise=0.2):
+                    tightness_levels=None, replicates=1, include_seeds=False, noise=None):
     """Generate instances using a systematic grid of seeds x scales x tightness x replicates."""
     if scales is None:
         scales = [0.25, 0.5, 0.75, 1.0, 1.5]
     if tightness_levels is None:
         tightness_levels = [0.1, 0.25, 0.5, 0.75, 1.0]
+    if noise is None:
+        noise = 0.2
+
+    # Check for filename collisions (custom grids with close decimal values)
+    test_names = set()
+    for s in scales:
+        for t in tightness_levels:
+            for r in range(1, replicates + 1):
+                name = instance_filename('x', s, t, replicate=r if replicates > 1 else None)
+                if name in test_names:
+                    print(f"Error: scale={s} and tightness={t} produce a duplicate filename '{name}'.")
+                    print("Use values that differ by at least 0.01 to avoid collisions.")
+                    sys.exit(1)
+                test_names.add(name)
 
     # Auto-discover seed files
     seed_files = sorted(glob.glob(os.path.join(seed_dir, '*.txt')))
@@ -382,7 +450,7 @@ def main():
                         help="Path to the seed instance file (not needed with --batch)")
     parser.add_argument('--count', type=int, default=1, help="Number of instances to generate")
     parser.add_argument('--scale', type=float, default=1.0, help="Scale factor for size")
-    parser.add_argument('--noise', type=float, default=0.1, help="Noise factor (e.g. 0.1 for 10%% perturbation)")
+    parser.add_argument('--noise', type=float, default=0.2, help="Noise factor (e.g. 0.2 for 20%% perturbation)")
     parser.add_argument('--out_dir', type=str, default='generated_instances', help="Output directory")
     parser.add_argument('--seed', type=int, default=None, help="Random seed for reproducibility")
     parser.add_argument('--tightness', type=float, default=None,
@@ -405,7 +473,7 @@ def main():
     if args.batch:
         generate_batch(
             args.seed_dir, args.out_dir,
-            random_seed=args.seed or 42,
+            random_seed=args.seed if args.seed is not None else 42,
             scales=args.scales,
             tightness_levels=args.tightness_levels,
             replicates=args.replicates,
