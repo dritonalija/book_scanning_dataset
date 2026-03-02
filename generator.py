@@ -236,10 +236,12 @@ def generate_new_instance(B, L, D, scores, libraries, scale_factor, noise, rng,
     else:
         new_D = max(1, min(int(D * scale_factor * rng.uniform(1.0 - noise, 1.0 + noise)), MAX_D))
 
-    # Feasibility guarantee: D must be > min signup time
+    # Feasibility guarantee: D must be > min signup time so at least one
+    # library can ship at least one book (a library with T_j signup days
+    # can only start shipping on day T_j, so D must be >= T_j + 1)
     min_signup = min(lib['signup'] for lib in new_libraries)
     if new_D <= min_signup:
-        new_D = min(max(new_D, int(min_signup * 1.5)), MAX_D)
+        new_D = min(min_signup + max(1, min_signup // 2), MAX_D)
 
     return new_B, new_L, new_D, new_scores, new_libraries
 
