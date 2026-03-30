@@ -23,6 +23,35 @@ MAX_N = 10**5       # max books per library
 MAX_T = 10**5       # max signup days per library
 MAX_M = 10**5       # max ship rate per library
 MAX_TOTAL_BOOKS = 10**6  # total books across all libraries
+TIGHTNESS_REL_TOL = 0.15
+TIGHTNESS_ABS_TOL = 0.02
+MAX_GENERATION_ATTEMPTS = 8
+OVERLAP_PRESETS = {
+    'default': {'popularity_gamma': 1.0, 'core_fraction': 0.0, 'core_weight': 0.0},
+    'hard': {'popularity_gamma': 1.8, 'core_fraction': 0.05, 'core_weight': 0.35},
+}
+STRUCTURE_PRESETS = {
+    'default': {
+        'group_fraction': 0.0,
+        'core_ratio': 0.0,
+        'core_take_ratio': 0.0,
+        'pool_ratio': 0.0,
+        'signup_compression': 0.0,
+        'rate_compression': 0.0,
+    },
+    'competitive': {
+        'group_fraction': 0.08,
+        'core_ratio': 0.35,
+        'core_take_ratio': 0.55,
+        'pool_ratio': 1.75,
+        'signup_compression': 0.45,
+        'rate_compression': 0.35,
+    },
+}
+SOURCE_REGIME_PRESETS = {
+    'default': ('default', 'default'),
+    'hard': ('hard', 'competitive'),
+}
 
 
 def read_instance(filepath):
@@ -108,9 +137,9 @@ def validate_instance(B, L, D, scores, libraries):
 
 
 def detect_seed_letter(filepath):
-    """Extract the seed letter (b, c, d, e, f) from a seed filename."""
+    """Extract the leading alphabetic seed code from a filename."""
     basename = os.path.basename(filepath).lower()
-    if basename and basename[0] in 'bcdef':
+    if basename and basename[0].isalpha():
         return basename[0]
     return None
 
@@ -154,7 +183,235 @@ def assign_books_with_overlap(new_B, target_n_books, rng, popularity_weights):
     return books.tolist()
 
 
-def generate_popularity_weights(new_B, rng):
+def deterministic_instance_seed(random_seed, source_name, scale, tightness, attempt,
+                                overlap_mode='default', popularity_gamma=1.0,
+                                core_fraction=0.0, core_weight=0.0,
+                                structure_mode='default', group_fraction=0.0,
+                                structure_core_ratio=0.0, structure_core_take_ratio=0.0,
+                                structure_pool_ratio=0.0, signup_compression=0.0,
+                                rate_compression=0.0):
+    """Cross-platform deterministic seed for one generation attempt."""
+    key = (
+        f"{random_seed}_{source_name}_{scale}_{tightness}_{attempt}_"
+        f"{overlap_mode}_{popularity_gamma}_{core_fraction}_{core_weight}_"
+        f"{structure_mode}_{group_fraction}_{structure_core_ratio}_"
+        f"{structure_core_take_ratio}_{structure_pool_ratio}_"
+        f"{signup_compression}_{rate_compression}"
+    )
+    return int(hashlib.sha256(key.encode()).hexdigest(), 16) % (2**31)
+
+
+def tightness_tolerance(target):
+    return max(TIGHTNESS_ABS_TOL, abs(target) * TIGHTNESS_REL_TOL)
+
+
+def resolve_overlap_config(overlap_mode, popularity_gamma=None,
+                           core_fraction=None, core_weight=None):
+    """Resolve overlap-generation parameters from a preset plus optional overrides."""
+    if overlap_mode not in OVERLAP_PRESETS:
+        raise ValueError(f"Unknown overlap_mode='{overlap_mode}'. Expected one of {sorted(OVERLAP_PRESETS)}")
+
+    preset = OVERLAP_PRESETS[overlap_mode]
+    gamma = preset['popularity_gamma'] if popularity_gamma is None else popularity_gamma
+    core_frac = preset['core_fraction'] if core_fraction is None else core_fraction
+    core_mass = preset['core_weight'] if core_weight is None else core_weight
+
+    if gamma <= 0:
+        raise ValueError("popularity_gamma must be > 0")
+    if not (0.0 <= core_frac < 1.0):
+        raise ValueError("core_fraction must be in [0, 1)")
+    if not (0.0 <= core_mass < 1.0):
+        raise ValueError("core_weight must be in [0, 1)")
+
+    return {
+        'overlap_mode': overlap_mode,
+        'popularity_gamma': float(gamma),
+        'core_fraction': float(core_frac),
+        'core_weight': float(core_mass),
+    }
+
+
+def resolve_structure_config(structure_mode, group_fraction=None, core_ratio=None,
+                             core_take_ratio=None, pool_ratio=None,
+                             signup_compression=None, rate_compression=None):
+    """Resolve structure-generation parameters from a preset plus optional overrides."""
+    if structure_mode not in STRUCTURE_PRESETS:
+        raise ValueError(f"Unknown structure_mode='{structure_mode}'. Expected one of {sorted(STRUCTURE_PRESETS)}")
+
+    preset = STRUCTURE_PRESETS[structure_mode]
+    config = {
+        'structure_mode': structure_mode,
+        'group_fraction': preset['group_fraction'] if group_fraction is None else group_fraction,
+        'core_ratio': preset['core_ratio'] if core_ratio is None else core_ratio,
+        'core_take_ratio': preset['core_take_ratio'] if core_take_ratio is None else core_take_ratio,
+        'pool_ratio': preset['pool_ratio'] if pool_ratio is None else pool_ratio,
+        'signup_compression': preset['signup_compression'] if signup_compression is None else signup_compression,
+        'rate_compression': preset['rate_compression'] if rate_compression is None else rate_compression,
+    }
+
+    bounded_keys = [
+        'group_fraction', 'core_ratio', 'core_take_ratio',
+        'pool_ratio', 'signup_compression', 'rate_compression',
+    ]
+    for key in bounded_keys:
+        if config[key] < 0.0:
+            raise ValueError(f"{key} must be >= 0")
+    if config['group_fraction'] >= 1.0:
+        raise ValueError("group_fraction must be in [0, 1)")
+    if config['core_ratio'] >= 1.0:
+        raise ValueError("core_ratio must be in [0, 1)")
+    if config['core_take_ratio'] >= 1.0:
+        raise ValueError("core_take_ratio must be in [0, 1)")
+    if config['signup_compression'] >= 1.0:
+        raise ValueError("signup_compression must be in [0, 1)")
+    if config['rate_compression'] >= 1.0:
+        raise ValueError("rate_compression must be in [0, 1)")
+
+    return {key: float(value) if key != 'structure_mode' else value for key, value in config.items()}
+
+
+def parse_source_regimes(spec):
+    """Parse per-source regimes like 'b:hard,c:default,be:hard'."""
+    if not spec:
+        return {}
+
+    mapping = {}
+    for token in str(spec).split(','):
+        token = token.strip()
+        if not token:
+            continue
+        if ':' not in token:
+            raise ValueError(
+                f"Invalid source regime token '{token}'. Expected format like 'b:hard'."
+            )
+        source, regime = token.split(':', 1)
+        source = source.strip()
+        regime = regime.strip()
+        if regime not in SOURCE_REGIME_PRESETS:
+            raise ValueError(
+                f"Unknown source regime '{regime}' for source '{source}'. "
+                f"Expected one of {sorted(SOURCE_REGIME_PRESETS)}."
+            )
+        mapping[source] = regime
+    return mapping
+
+
+def resolve_source_generation_config(source_name, source_regimes, default_overlap_config,
+                                     default_structure_config):
+    """Resolve the overlap/structure config for one source."""
+    regime = source_regimes.get(source_name)
+    if regime is None:
+        return default_overlap_config, default_structure_config, 'global'
+
+    overlap_mode, structure_mode = SOURCE_REGIME_PRESETS[regime]
+    return (
+        resolve_overlap_config(overlap_mode),
+        resolve_structure_config(structure_mode),
+        regime,
+    )
+
+
+def blend_toward_median(value, median_value, strength):
+    """Move a value toward the median while keeping positive integer bounds."""
+    if strength <= 0.0:
+        return int(value)
+    blended = (1.0 - strength) * value + strength * median_value
+    return max(1, int(round(blended)))
+
+
+def build_competitive_group_templates(new_B, new_L, avg_target_n_books, rng,
+                                      popularity_weights, score_weights, structure_config):
+    """Create group-level shared cores/pools that induce hard library competition."""
+    if structure_config['structure_mode'] == 'default' or new_L <= 1:
+        return None, None
+
+    n_groups = int(round(new_L * structure_config['group_fraction']))
+    n_groups = max(3, min(24, n_groups))
+    n_groups = min(n_groups, new_L)
+
+    group_ids = np.arange(new_L) % n_groups
+    rng.shuffle(group_ids)
+
+    mean_size = max(8, int(round(avg_target_n_books)))
+    core_size = max(4, min(new_B, int(round(mean_size * structure_config['core_ratio']))))
+    pool_size = max(core_size + 8, min(new_B, int(round(mean_size * structure_config['pool_ratio']))))
+
+    combined_weights = popularity_weights * score_weights
+    combined_weights = combined_weights / combined_weights.sum()
+
+    group_templates = []
+    for _ in range(n_groups):
+        pool_books = rng.choice(new_B, size=pool_size, replace=False, p=combined_weights)
+        core_books = pool_books[:core_size]
+        extra_pool = pool_books[core_size:]
+        group_templates.append({
+            'core': core_books.tolist(),
+            'pool': extra_pool.tolist(),
+        })
+
+    return group_ids.tolist(), group_templates
+
+
+def assign_books_competitive(target_n_books, rng, popularity_weights, group_template,
+                             structure_config):
+    """Assign books using a shared group core plus unique tail books."""
+    target_n_books = min(target_n_books, len(popularity_weights))
+    if target_n_books <= 0:
+        return []
+
+    selected = []
+    selected_set = set()
+
+    core_books = group_template['core']
+    pool_books = group_template['pool']
+
+    desired_core = min(len(core_books), target_n_books, int(round(target_n_books * structure_config['core_take_ratio'])))
+    if desired_core > 0:
+        core_weights = np.array([popularity_weights[bid] for bid in core_books], dtype=np.float64)
+        core_weights = core_weights / core_weights.sum()
+        chosen_core = rng.choice(np.array(core_books, dtype=np.int64), size=desired_core, replace=False, p=core_weights)
+        for bid in chosen_core.tolist():
+            if bid not in selected_set:
+                selected.append(bid)
+                selected_set.add(bid)
+
+    remaining = target_n_books - len(selected)
+    if remaining > 0 and pool_books:
+        pool_candidates = [bid for bid in pool_books if bid not in selected_set]
+        if pool_candidates:
+            take = min(remaining, len(pool_candidates))
+            pool_weights = np.array([popularity_weights[bid] for bid in pool_candidates], dtype=np.float64)
+            pool_weights = pool_weights / pool_weights.sum()
+            chosen_pool = rng.choice(np.array(pool_candidates, dtype=np.int64), size=take, replace=False, p=pool_weights)
+            for bid in chosen_pool.tolist():
+                if bid not in selected_set:
+                    selected.append(bid)
+                    selected_set.add(bid)
+
+    remaining = target_n_books - len(selected)
+    if remaining > 0:
+        all_books = np.arange(len(popularity_weights))
+        retries = 0
+        while remaining > 0 and retries < 4:
+            sample_size = min(len(popularity_weights), max(remaining * 3, remaining + 32))
+            candidates = rng.choice(all_books, size=sample_size, replace=False, p=popularity_weights)
+            added = 0
+            for bid in candidates.tolist():
+                if bid not in selected_set:
+                    selected.append(bid)
+                    selected_set.add(bid)
+                    added += 1
+                    remaining -= 1
+                    if remaining == 0:
+                        break
+            if added == 0:
+                retries += 1
+
+    return selected[:target_n_books]
+
+
+def generate_popularity_weights(new_B, rng, popularity_gamma=1.0,
+                                core_fraction=0.0, core_weight=0.0):
     """Generate popularity weights for books using an exponential distribution.
 
     A small number of books will be very popular (high weight) while most
@@ -162,12 +419,24 @@ def generate_popularity_weights(new_B, rng):
     sample from this distribution.
     """
     raw_weights = rng.exponential(scale=1.0, size=new_B)
+    if popularity_gamma != 1.0:
+        raw_weights = np.power(raw_weights, popularity_gamma)
+
     weights = raw_weights / raw_weights.sum()
+    if core_fraction > 0.0 and core_weight > 0.0:
+        core_size = min(new_B, max(1, int(round(new_B * core_fraction))))
+        core_indices = rng.choice(new_B, size=core_size, replace=False)
+        weights *= (1.0 - core_weight)
+        core_weights = raw_weights[core_indices]
+        core_weights = core_weights / core_weights.sum()
+        weights[core_indices] += core_weight * core_weights
+
     return weights
 
 
 def generate_new_instance(B, L, D, scores, libraries, scale_factor, noise, rng,
-                          tightness=None, seed_letter=None):
+                          tightness=None, seed_letter=None, overlap_config=None,
+                          structure_config=None):
     """Generates a new instance by scaling and perturbing the seed instance."""
     # Apply noise to B and L dimensions, clamped to Hash Code bounds
     new_B = max(1, min(int(B * scale_factor * rng.uniform(1.0 - noise, 1.0 + noise)), MAX_B))
@@ -178,8 +447,21 @@ def generate_new_instance(B, L, D, scores, libraries, scale_factor, noise, rng,
         seed_letter = 'c'  # default to heterogeneous behavior
     new_scores = generate_scores(scores, new_B, seed_letter, noise, rng)
 
+    if overlap_config is None:
+        overlap_config = resolve_overlap_config('default')
+    if structure_config is None:
+        structure_config = resolve_structure_config('default')
+
     # Generate popularity weights for book assignment
-    popularity_weights = generate_popularity_weights(new_B, rng)
+    popularity_weights = generate_popularity_weights(
+        new_B,
+        rng,
+        popularity_gamma=overlap_config['popularity_gamma'],
+        core_fraction=overlap_config['core_fraction'],
+        core_weight=overlap_config['core_weight'],
+    )
+    score_weights = np.asarray(new_scores, dtype=np.float64) + 1.0
+    score_weights = score_weights / score_weights.sum()
 
     # Map each new library to a seed library:
     # - same size: 1-to-1 mapping
@@ -196,14 +478,34 @@ def generate_new_instance(B, L, D, scores, libraries, scale_factor, noise, rng,
         rng.shuffle(lib_indices)
         lib_indices = lib_indices.tolist()
 
+    avg_target_n_books = np.mean([lib['n_books'] for lib in libraries]) * scale_factor if libraries else 1.0
+    group_ids, group_templates = build_competitive_group_templates(
+        new_B,
+        new_L,
+        avg_target_n_books,
+        rng,
+        popularity_weights,
+        score_weights,
+        structure_config,
+    )
+
+    signup_values = np.array([lib['signup'] for lib in libraries], dtype=np.float64)
+    rate_values = np.array([lib['ship_rate'] for lib in libraries], dtype=np.float64)
+    signup_median = float(np.median(signup_values)) if len(signup_values) > 0 else 1.0
+    rate_median = float(np.median(rate_values)) if len(rate_values) > 0 else 1.0
+
     new_libraries = []
     total_signup = 0
     for i in range(new_L):
         orig_lib = libraries[lib_indices[i]]
 
         # Perturb signup and ship rate, clamped to Hash Code bounds
-        new_signup = max(1, min(int(orig_lib['signup'] * rng.uniform(1.0 - noise, 1.0 + noise)), MAX_T))
-        new_ship_rate = max(1, min(int(orig_lib['ship_rate'] * rng.uniform(1.0 - noise, 1.0 + noise)), MAX_M))
+        raw_signup = max(1, min(int(orig_lib['signup'] * rng.uniform(1.0 - noise, 1.0 + noise)), MAX_T))
+        raw_ship_rate = max(1, min(int(orig_lib['ship_rate'] * rng.uniform(1.0 - noise, 1.0 + noise)), MAX_M))
+        new_signup = blend_toward_median(raw_signup, signup_median, structure_config['signup_compression'])
+        new_ship_rate = blend_toward_median(raw_ship_rate, rate_median, structure_config['rate_compression'])
+        new_signup = max(1, min(new_signup, MAX_T))
+        new_ship_rate = max(1, min(new_ship_rate, MAX_M))
 
         # Determine target number of books (clamped to new_B and MAX_N)
         target_n_books = max(1, min(
@@ -211,8 +513,18 @@ def generate_new_instance(B, L, D, scores, libraries, scale_factor, noise, rng,
             new_B, MAX_N
         ))
 
-        # Popularity-weighted book assignment
-        new_books = assign_books_with_overlap(new_B, target_n_books, rng, popularity_weights)
+        # Popularity-weighted or competitive group assignment
+        if group_templates is None:
+            new_books = assign_books_with_overlap(new_B, target_n_books, rng, popularity_weights)
+        else:
+            template = group_templates[group_ids[i]]
+            new_books = assign_books_competitive(
+                target_n_books,
+                rng,
+                popularity_weights,
+                template,
+                structure_config,
+            )
 
         new_libraries.append({
             'n_books': len(new_books),
@@ -232,9 +544,19 @@ def generate_new_instance(B, L, D, scores, libraries, scale_factor, noise, rng,
             total_signup -= removed['signup']
         new_L = len(new_libraries)
 
-    # Compute D based on tightness or scale from seed, clamped to MAX_D
+    # Compute D based on tightness or scale from seed, clamped to MAX_D.
+    # When a requested tightness would violate D <= MAX_D, we deterministically
+    # clip to the maximum feasible actual-tightness target for this candidate.
+    requested_tightness = None
+    effective_tightness = None
+    max_feasible_tightness = None
+    tightness_clipped = False
     if tightness is not None:
-        new_D = max(1, min(int(total_signup * tightness), MAX_D))
+        requested_tightness = float(tightness)
+        max_feasible_tightness = min(1.0, MAX_D / total_signup) if total_signup > 0 else 1.0
+        effective_tightness = min(requested_tightness, max_feasible_tightness)
+        tightness_clipped = effective_tightness < requested_tightness
+        new_D = max(1, min(int(total_signup * effective_tightness), MAX_D))
     else:
         new_D = max(1, min(int(D * scale_factor * rng.uniform(1.0 - noise, 1.0 + noise)), MAX_D))
 
@@ -245,10 +567,36 @@ def generate_new_instance(B, L, D, scores, libraries, scale_factor, noise, rng,
     if new_D <= min_signup:
         new_D = min(min_signup + max(1, min_signup // 2), MAX_D)
 
-    return new_B, new_L, new_D, new_scores, new_libraries
+    metadata = {
+        'requested_tightness': requested_tightness,
+        'effective_target_tightness': effective_tightness,
+        'max_feasible_tightness': max_feasible_tightness,
+        'tightness_clipped': tightness_clipped,
+        'overlap_mode': overlap_config['overlap_mode'],
+        'popularity_gamma': overlap_config['popularity_gamma'],
+        'core_fraction': overlap_config['core_fraction'],
+        'core_weight': overlap_config['core_weight'],
+        'structure_mode': structure_config['structure_mode'],
+        'group_fraction': structure_config['group_fraction'],
+        'structure_core_ratio': structure_config['core_ratio'],
+        'structure_core_take_ratio': structure_config['core_take_ratio'],
+        'structure_pool_ratio': structure_config['pool_ratio'],
+        'signup_compression': structure_config['signup_compression'],
+        'rate_compression': structure_config['rate_compression'],
+    }
+
+    return new_B, new_L, new_D, new_scores, new_libraries, metadata
 
 
-def compute_instance_stats(B, L, D, scores, libraries, seed_name="", scale=0.0, tightness_param=0.0):
+def compute_instance_stats(
+    B, L, D, scores, libraries, seed_name="", scale=0.0, tightness_param=0.0,
+    effective_target_tightness=0.0, max_feasible_tightness=0.0,
+    tightness_clipped=False, generation_attempt=0, overlap_mode='default',
+    popularity_gamma=1.0, core_fraction=0.0, core_weight=0.0,
+    structure_mode='default', group_fraction=0.0, structure_core_ratio=0.0,
+    structure_core_take_ratio=0.0, structure_pool_ratio=0.0,
+    signup_compression=0.0, rate_compression=0.0,
+):
     """Compute statistics about an instance for paper reporting."""
     signups = [lib['signup'] for lib in libraries]
     ship_rates = [lib['ship_rate'] for lib in libraries]
@@ -303,6 +651,21 @@ def compute_instance_stats(B, L, D, scores, libraries, seed_name="", scale=0.0, 
         'seed': seed_name,
         'scale': scale,
         'tightness_param': tightness_param,
+        'effective_target_tightness': round(effective_target_tightness, 4),
+        'max_feasible_tightness': round(max_feasible_tightness, 4),
+        'tightness_clipped': int(bool(tightness_clipped)),
+        'generation_attempt': generation_attempt,
+        'overlap_mode': overlap_mode,
+        'popularity_gamma': round(popularity_gamma, 4),
+        'core_fraction': round(core_fraction, 4),
+        'core_weight': round(core_weight, 4),
+        'structure_mode': structure_mode,
+        'group_fraction': round(group_fraction, 4),
+        'structure_core_ratio': round(structure_core_ratio, 4),
+        'structure_core_take_ratio': round(structure_core_take_ratio, 4),
+        'structure_pool_ratio': round(structure_pool_ratio, 4),
+        'signup_compression': round(signup_compression, 4),
+        'rate_compression': round(rate_compression, 4),
         'B': B,
         'L': L,
         'D': D,
@@ -335,7 +698,12 @@ def instance_filename(seed_letter, scale, tightness):
 
 def generate_batch(seed_dir, out_dir, random_seed=42, scales=None,
                     tightness_levels=None, include_seeds=False, noise=None,
-                    crossbreed=False):
+                    crossbreed=False, overlap_mode='default',
+                    popularity_gamma=None, core_fraction=None, core_weight=None,
+                    structure_mode='default', group_fraction=None,
+                    structure_core_ratio=None, structure_core_take_ratio=None,
+                    structure_pool_ratio=None, signup_compression=None,
+                    rate_compression=None, source_regimes=None):
     """Generate instances using a systematic grid of seeds x scales x tightness."""
     if scales is None:
         if crossbreed:
@@ -349,6 +717,22 @@ def generate_batch(seed_dir, out_dir, random_seed=42, scales=None,
             tightness_levels = [0.1, 0.25, 0.5, 0.75, 1.0]
     if noise is None:
         noise = 0.2
+    overlap_config = resolve_overlap_config(
+        overlap_mode,
+        popularity_gamma=popularity_gamma,
+        core_fraction=core_fraction,
+        core_weight=core_weight,
+    )
+    structure_config = resolve_structure_config(
+        structure_mode,
+        group_fraction=group_fraction,
+        core_ratio=structure_core_ratio,
+        core_take_ratio=structure_core_take_ratio,
+        pool_ratio=structure_pool_ratio,
+        signup_compression=signup_compression,
+        rate_compression=rate_compression,
+    )
+    source_regime_map = parse_source_regimes(source_regimes)
 
     # Check for filename collisions (custom grids with close decimal values)
     test_names = set()
@@ -401,6 +785,25 @@ def generate_batch(seed_dir, out_dir, random_seed=42, scales=None,
     print(f"Scales: {scales}")
     print(f"Tightness: {tightness_levels}")
     print(f"Noise: {noise}, Random seed: {random_seed}")
+    print(
+        "Overlap: "
+        f"mode={overlap_config['overlap_mode']}, "
+        f"gamma={overlap_config['popularity_gamma']}, "
+        f"core_fraction={overlap_config['core_fraction']}, "
+        f"core_weight={overlap_config['core_weight']}"
+    )
+    print(
+        "Structure: "
+        f"mode={structure_config['structure_mode']}, "
+        f"group_fraction={structure_config['group_fraction']}, "
+        f"core_ratio={structure_config['core_ratio']}, "
+        f"core_take_ratio={structure_config['core_take_ratio']}, "
+        f"pool_ratio={structure_config['pool_ratio']}, "
+        f"signup_compression={structure_config['signup_compression']}, "
+        f"rate_compression={structure_config['rate_compression']}"
+    )
+    if source_regime_map:
+        print(f"Source-specific regimes: {source_regime_map}")
     print()
 
     os.makedirs(out_dir, exist_ok=True)
@@ -420,31 +823,84 @@ def generate_batch(seed_dir, out_dir, random_seed=42, scales=None,
             print(f"  Copied {os.path.basename(sf)}")
             stats = compute_instance_stats(
                 B, L, D, scores, libs,
-                seed_name=f"{letter}_orig", scale=1.0, tightness_param=0.0
+                seed_name=f"{letter}_orig", scale=1.0, tightness_param=0.0,
+                effective_target_tightness=0.0, max_feasible_tightness=0.0,
+                tightness_clipped=False, generation_attempt=0,
+                overlap_mode='seed',
+                popularity_gamma=0.0,
+                core_fraction=0.0,
+                core_weight=0.0,
+                structure_mode='seed',
+                group_fraction=0.0,
+                structure_core_ratio=0.0,
+                structure_core_take_ratio=0.0,
+                structure_pool_ratio=0.0,
+                signup_compression=0.0,
+                rate_compression=0.0,
             )
             all_stats.append(stats)
         print()
 
     for src_name, B, L, D, scores, libraries, score_letter in sources:
         is_cross = len(src_name) > 1
+        src_overlap_config, src_structure_config, src_regime = resolve_source_generation_config(
+            src_name,
+            source_regime_map,
+            overlap_config,
+            structure_config,
+        )
         if is_cross:
-            print(f"--- Cross-breed: {src_name[0]} (scores) x {src_name[1]} (structure) ---")
+            print(
+                f"--- Cross-breed: {src_name[0]} (scores) x {src_name[1]} (structure) "
+                f"[regime={src_regime}] ---"
+            )
         else:
-            print(f"--- Seed: {src_name} ---")
+            print(f"--- Seed: {src_name} [regime={src_regime}] ---")
 
         for scale in scales:
             for tightness in tightness_levels:
                 count += 1
-                # Deterministic RNG: hashlib for cross-platform reproducibility
-                key = f"{random_seed}_{src_name}_{scale}_{tightness}"
-                instance_seed = int(hashlib.sha256(key.encode()).hexdigest(), 16) % (2**31)
-                rng = np.random.default_rng(instance_seed)
-
                 t0 = time.time()
-                nB, nL, nD, nScores, nLibs = generate_new_instance(
-                    B, L, D, scores, libraries, scale, noise, rng,
-                    tightness=tightness, seed_letter=score_letter
-                )
+                best_candidate = None
+                best_gap = None
+                selected_attempt = 0
+
+                for attempt in range(MAX_GENERATION_ATTEMPTS):
+                    instance_seed = deterministic_instance_seed(
+                        random_seed, src_name, scale, tightness, attempt,
+                        overlap_mode=src_overlap_config['overlap_mode'],
+                        popularity_gamma=src_overlap_config['popularity_gamma'],
+                        core_fraction=src_overlap_config['core_fraction'],
+                        core_weight=src_overlap_config['core_weight'],
+                        structure_mode=src_structure_config['structure_mode'],
+                        group_fraction=src_structure_config['group_fraction'],
+                        structure_core_ratio=src_structure_config['core_ratio'],
+                        structure_core_take_ratio=src_structure_config['core_take_ratio'],
+                        structure_pool_ratio=src_structure_config['pool_ratio'],
+                        signup_compression=src_structure_config['signup_compression'],
+                        rate_compression=src_structure_config['rate_compression'],
+                    )
+                    rng = np.random.default_rng(instance_seed)
+                    candidate = generate_new_instance(
+                        B, L, D, scores, libraries, scale, noise, rng,
+                        tightness=tightness, seed_letter=score_letter,
+                        overlap_config=src_overlap_config,
+                        structure_config=src_structure_config,
+                    )
+                    nB, nL, nD, nScores, nLibs, meta = candidate
+                    target = meta['effective_target_tightness']
+                    actual = (nD / sum(lib['signup'] for lib in nLibs)) if nLibs else 0.0
+                    gap = abs(actual - target) if target is not None else 0.0
+
+                    if best_candidate is None or gap < best_gap:
+                        best_candidate = candidate
+                        best_gap = gap
+                        selected_attempt = attempt
+
+                    if target is None or gap <= tightness_tolerance(target):
+                        break
+
+                nB, nL, nD, nScores, nLibs, meta = best_candidate
 
                 validate_instance(nB, nL, nD, nScores, nLibs)
 
@@ -455,12 +911,30 @@ def generate_batch(seed_dir, out_dir, random_seed=42, scales=None,
 
                 stats = compute_instance_stats(
                     nB, nL, nD, nScores, nLibs,
-                    seed_name=src_name, scale=scale, tightness_param=tightness
+                    seed_name=src_name,
+                    scale=scale,
+                    tightness_param=tightness,
+                    effective_target_tightness=meta['effective_target_tightness'] or 0.0,
+                    max_feasible_tightness=meta['max_feasible_tightness'] or 0.0,
+                    tightness_clipped=meta['tightness_clipped'],
+                    generation_attempt=selected_attempt,
+                    overlap_mode=meta['overlap_mode'],
+                    popularity_gamma=meta['popularity_gamma'],
+                    core_fraction=meta['core_fraction'],
+                    core_weight=meta['core_weight'],
+                    structure_mode=meta['structure_mode'],
+                    group_fraction=meta['group_fraction'],
+                    structure_core_ratio=meta['structure_core_ratio'],
+                    structure_core_take_ratio=meta['structure_core_take_ratio'],
+                    structure_pool_ratio=meta['structure_pool_ratio'],
+                    signup_compression=meta['signup_compression'],
+                    rate_compression=meta['rate_compression'],
                 )
                 all_stats.append(stats)
 
                 print(f"  [{count}/{n_generated}] {fname}  "
-                      f"(B={nB}, L={nL}, D={nD}, tightness={stats['actual_tightness']}) "
+                      f"(B={nB}, L={nL}, D={nD}, actual={stats['actual_tightness']}, "
+                      f"target={stats['effective_target_tightness']}) "
                       f"— {elapsed:.2f}s")
 
     # Write summary CSV
@@ -500,6 +974,31 @@ def main():
     parser.add_argument('--crossbreed', action='store_true',
                         help="Generate hybrid instances by cross-breeding pairs of seeds "
                              "(scores from one seed, library structure from another)")
+    parser.add_argument('--overlap_mode', choices=sorted(OVERLAP_PRESETS), default='default',
+                        help="Overlap preset for book assignment. 'hard' increases duplication/conflict.")
+    parser.add_argument('--popularity_gamma', type=float, default=None,
+                        help="Optional override for popularity concentration (>1 gives more overlap).")
+    parser.add_argument('--core_fraction', type=float, default=None,
+                        help="Optional override for the fraction of books treated as a shared hot core.")
+    parser.add_argument('--core_weight', type=float, default=None,
+                        help="Optional override for the probability mass assigned to the hot-core books.")
+    parser.add_argument('--structure_mode', choices=sorted(STRUCTURE_PRESETS), default='default',
+                        help="Library structure preset. 'competitive' makes libraries more confusable for greedy.")
+    parser.add_argument('--group_fraction', type=float, default=None,
+                        help="Optional override for the fraction of library groups in competitive mode.")
+    parser.add_argument('--structure_core_ratio', type=float, default=None,
+                        help="Optional override for the shared core size as a fraction of average library size.")
+    parser.add_argument('--structure_core_take_ratio', type=float, default=None,
+                        help="Optional override for how much of each library comes from the shared core.")
+    parser.add_argument('--structure_pool_ratio', type=float, default=None,
+                        help="Optional override for group pool size relative to average library size.")
+    parser.add_argument('--signup_compression', type=float, default=None,
+                        help="Optional override for compression of signup times toward the median.")
+    parser.add_argument('--rate_compression', type=float, default=None,
+                        help="Optional override for compression of ship rates toward the median.")
+    parser.add_argument('--source_regimes', type=str, default=None,
+                        help="Optional per-source regimes like 'b:default,c:default,e:hard,be:hard'. "
+                             "Regimes: default=(default/default), hard=(hard/competitive).")
 
     args = parser.parse_args()
 
@@ -512,6 +1011,18 @@ def main():
             include_seeds=args.include_seeds,
             noise=args.noise,
             crossbreed=args.crossbreed,
+            overlap_mode=args.overlap_mode,
+            popularity_gamma=args.popularity_gamma,
+            core_fraction=args.core_fraction,
+            core_weight=args.core_weight,
+            structure_mode=args.structure_mode,
+            group_fraction=args.group_fraction,
+            structure_core_ratio=args.structure_core_ratio,
+            structure_core_take_ratio=args.structure_core_take_ratio,
+            structure_pool_ratio=args.structure_pool_ratio,
+            signup_compression=args.signup_compression,
+            rate_compression=args.rate_compression,
+            source_regimes=args.source_regimes,
         )
         return
 
@@ -525,6 +1036,38 @@ def main():
     print(f"Reading seed: {args.seed_file}")
     B, L, D, scores, libraries = read_instance(args.seed_file)
     print(f"Original: {B} books, {L} libraries, {D} days")
+    overlap_config = resolve_overlap_config(
+        args.overlap_mode,
+        popularity_gamma=args.popularity_gamma,
+        core_fraction=args.core_fraction,
+        core_weight=args.core_weight,
+    )
+    structure_config = resolve_structure_config(
+        args.structure_mode,
+        group_fraction=args.group_fraction,
+        core_ratio=args.structure_core_ratio,
+        core_take_ratio=args.structure_core_take_ratio,
+        pool_ratio=args.structure_pool_ratio,
+        signup_compression=args.signup_compression,
+        rate_compression=args.rate_compression,
+    )
+    print(
+        "Overlap config: "
+        f"mode={overlap_config['overlap_mode']}, "
+        f"gamma={overlap_config['popularity_gamma']}, "
+        f"core_fraction={overlap_config['core_fraction']}, "
+        f"core_weight={overlap_config['core_weight']}"
+    )
+    print(
+        "Structure config: "
+        f"mode={structure_config['structure_mode']}, "
+        f"group_fraction={structure_config['group_fraction']}, "
+        f"core_ratio={structure_config['core_ratio']}, "
+        f"core_take_ratio={structure_config['core_take_ratio']}, "
+        f"pool_ratio={structure_config['pool_ratio']}, "
+        f"signup_compression={structure_config['signup_compression']}, "
+        f"rate_compression={structure_config['rate_compression']}"
+    )
 
     base_name = os.path.basename(args.seed_file).split('.')[0]
 
@@ -532,9 +1075,11 @@ def main():
 
     for i in range(args.count):
         t0 = time.time()
-        nB, nL, nD, nScores, nLibs = generate_new_instance(
+        nB, nL, nD, nScores, nLibs, meta = generate_new_instance(
             B, L, D, scores, libraries, args.scale, args.noise, rng,
-            tightness=args.tightness, seed_letter=seed_letter
+            tightness=args.tightness, seed_letter=seed_letter,
+            overlap_config=overlap_config,
+            structure_config=structure_config,
         )
 
         out_name = f"{base_name}_s{args.scale}_n{args.noise}_{i+1}.txt"
@@ -547,7 +1092,22 @@ def main():
         # Print stats if requested via tightness
         stats = compute_instance_stats(nB, nL, nD, nScores, nLibs,
                                        seed_name=base_name, scale=args.scale,
-                                       tightness_param=args.tightness or 0.0)
+                                       tightness_param=args.tightness or 0.0,
+                                       effective_target_tightness=meta['effective_target_tightness'] or 0.0,
+                                       max_feasible_tightness=meta['max_feasible_tightness'] or 0.0,
+                                       tightness_clipped=meta['tightness_clipped'],
+                                       generation_attempt=0,
+                                       overlap_mode=meta['overlap_mode'],
+                                       popularity_gamma=meta['popularity_gamma'],
+                                       core_fraction=meta['core_fraction'],
+                                       core_weight=meta['core_weight'],
+                                       structure_mode=meta['structure_mode'],
+                                       group_fraction=meta['group_fraction'],
+                                       structure_core_ratio=meta['structure_core_ratio'],
+                                       structure_core_take_ratio=meta['structure_core_take_ratio'],
+                                       structure_pool_ratio=meta['structure_pool_ratio'],
+                                       signup_compression=meta['signup_compression'],
+                                       rate_compression=meta['rate_compression'])
         print(f"  Stats: tightness={stats['actual_tightness']}, "
               f"score_cv={stats['score_cv']}, "
               f"jaccard={stats['jaccard_overlap_mean']}, "
