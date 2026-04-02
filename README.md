@@ -18,7 +18,7 @@ Python 3.10+ is recommended.
 Core dependencies:
 
 ```bash
-pip install numpy
+pip install -r requirements.txt
 ```
 
 Optional dependencies:
@@ -27,6 +27,7 @@ Optional dependencies:
 pip install pandas scikit-learn plotly numba
 ```
 
+- `requirements.txt` includes the packages used across generation, analysis, and benchmarking workflows
 - `pandas`, `scikit-learn`, and `plotly` are only needed for `analyze.py`
 
 ## Example Dataset
